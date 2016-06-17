@@ -1,6 +1,7 @@
 <?php
 namespace es\eucm\xapi;
 
+
 /**
  * Based on:
  *  - https://gist.github.com/jadb/7cb2c0053a756eb80d58
@@ -11,11 +12,15 @@ class GitHubWebhookHandler
 
     private $hookSecret;
 
-    public function __construct($hookSecret, $profileGenerationQueueFolder, $xapiProfileRepoPath)
+    private Github\Client $ghClient;
+
+    public function __construct($hookSecret, $profileGenerationQueueFolder, $xapiProfileRepoPath, $ghPersonalAccessToken)
     {
         $this->hookSecret = $hookSecret;
         $this->profileGenerationQueueFolder = $profileGenerationQueueFolder;
         $this->xapiProfileRepoPath = $xapiProfileRepoPath;
+        $this->ghClient = new \Github\Client();
+        $this->ghClient->authenticate($ghPersonalAccessToken, \Github\Client::AUTH_HTTP_TOKEN);
     }
 
     public function handle()
@@ -77,7 +82,7 @@ class GitHubWebhookHandler
                 echo 'pong';
             break;
             case 'pull_request':
-                $this->processPullRequest($payload);
+                $this->processPullRequest($client, $payload);
             break;
             default:
                 echo '^_^ nothing to do';
@@ -85,14 +90,34 @@ class GitHubWebhookHandler
         }
     }
 
-    private function processPullRequest($payload)
+    private function processPullRequest($client, $payload)
     {
+        if ($payload->action === 'open') {
+            //https://developer.github.com/guides/building-a-ci-server/
+            $user = $pull_request->user->login;
+            $repo = $pull_request->head->repo->name;
+            $ref = $pull_request->head->sha;
+
+            $params = array('state' => 'pending', 'target_url' => 'xxx', 'description' => 'Starting generation...', 'context' => 'continuous-integration/xapi-ci-server');
+            $data = $this->ghClient->api('repo')->statuses()->create($user, $repo, $ref, $params);
+
+        }
         if ($payload->action === 'closed' && $payload->pull_request->merged && $payload->pull_request->base->ref == 'master') {
             $this->generateProfile($payload->pull_request);
+            // Start deployment
+            $user = $pull_request->user->login;
+            $repo = $pull_request->base->repo->name;
+            $ref = $pull_request->merge_commit_sha;
+            $objPayload = new stdClass();
+            $objPayload->environment = 'production';
+            $objPayload->deploy_user = $user;
+            $payload = json_encode($objPayload);
+            $params = array('ref' => $ref, 'environment' => 'production', 'description' => 'Deploying my sweet branch', 'payload' => $payload);
+            $data = $this->ghClient->api('deployment')->create($user, $repo, $params);
         }
     }
 
-    function generateProfile($pullRequest)
+    private function generateProfile($pullRequest)
     {
         $repoUrl = $pullRequest->base->repo->clone_url;
         $ref = $pullRequest->merge_commit_sha;
@@ -106,5 +131,22 @@ class GitHubWebhookHandler
 
         http_response_code(202);
         echo "Queuing HTML profile generation";
+    }
+
+    function process_deployment($client, $payload)
+    {
+        $payloadObj = json_decode($payload->deployment->payload);
+        echo "Processing '{$payload->deployment->description}' for {$payloadObj->deploy_user} to {$payloadObj->environment}";
+        sleep(2);
+        $params = array('state' => 'pending');
+        $data = $this->ghClient->api('deployment')->updateStatus($payloadObj->deploy_user, $payload->repository->name, $payload->deployment->id, $params);
+        sleep(2);
+        $params = array('state' => 'success');
+        $data = $this->ghClient->api('deployment')->updateStatus($payloadObj->deploy_user, $payload->repository->name, $payload->deployment->id, $params);
+    }
+
+    function update_deployment_status($client, $payload)
+    {
+        echo "Deployment status for '{$payload->id}' is {$payload->state}";
     }
 }
